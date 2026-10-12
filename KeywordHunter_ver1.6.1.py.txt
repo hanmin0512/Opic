@@ -1,0 +1,2080 @@
+# -*- coding: utf-8 -*-
+#
+# KeywordHunter - Burp Suite extension (Jython 2.7)
+# ---------------------------------------------------
+# HTTP history 전체에서 키워드로 요청/응답을 검색하는 정보수집 보조 도구.
+#
+# 기능:
+#   - 언어 선택(한국어 / English)
+#   - 대상 필터: Scope 연동 / 도메인 체크리스트(찾기 + 전체 토글) / MIME / 최대 크기 / 검색범위
+#   - 키워드 관리: 추가·삭제·on/off, 정규식, Paste(클립보드 일괄), 텍스트파일 불러오기, 프리셋
+#                   키워드 클릭 = 해당 키워드 필터, 다시 클릭 = 해제(전체 표시)
+#   - 한글 검색: charset 자동판별 + 인코딩 변형(\uXXXX / %XX / &#...;) 동시 검색
+#   - 결과 뷰어: 요청·응답에 검색칸(선택 키워드 자동 입력) + 텍스트 변경 시 자동 스크롤
+#   - 일괄 스캔(백그라운드 + 진행률) / 실시간 모드 / Send to Repeater / CSV 내보내기
+#
+# 설치:
+#   1) Jython standalone 2.7.x jar 다운로드
+#   2) Burp > Extensions > Extensions settings > Python environment 에 jar 지정
+#   3) Extensions > Add > Extension type: Python > 이 파일 선택
+#
+from burp import IBurpExtender, ITab, IHttpListener, IContextMenuFactory
+from java.lang import String as JString, Thread, Runnable, Boolean
+from java.awt import BorderLayout, Color, Font, FlowLayout, GridLayout, Toolkit
+from java.awt.datatransfer import DataFlavor
+from java.awt.event import ActionListener, MouseAdapter
+from java.util.regex import Pattern
+from javax.swing import (JPanel, JSplitPane, JTabbedPane, JTable, JScrollPane,
+                         JButton, JLabel, JTextField, JTextArea, JCheckBox,
+                         JComboBox, JMenuItem, JFileChooser, BorderFactory,
+                         SwingUtilities, JProgressBar, ListSelectionModel,
+                         RowFilter, JOptionPane)
+from javax.swing.table import (DefaultTableModel, TableRowSorter,
+                               DefaultTableCellRenderer)
+from javax.swing.event import ListSelectionListener, DocumentListener, ChangeListener
+from javax.swing.text import DefaultHighlighter
+from collections import OrderedDict
+import re
+import csv
+import json
+import math
+import base64
+
+TOOL_PROXY = 0x04
+
+NEW_TAB_COLOR = Color(255, 160, 70)    # 새 데이터 들어온 탭
+NEW_ROW_COLOR = Color(255, 236, 150)   # 새로 추가된(미확인) 행
+
+PRESETS = {
+    u"secret":   [u"api_key", u"apikey", u"secret", u"token", u"password",
+                  u"passwd", u"private_key", u"access_key", u"aws_secret"],
+    u"dev":      [u"TODO", u"FIXME", u"console.log", u"debugger", u"debug",
+                  u"test", u"dummy"],
+    u"internal": [u"localhost", u"127.0.0.1", u"192.168.", u"10.", u"internal",
+                  u"dev.", u"staging."],
+    u"cloud":    [u"s3.amazonaws.com", u"blob.core.windows.net",
+                  u"firebaseio.com", u"storage.googleapis.com"],
+    u"admin":    [u"admin", u"manage", u"isAdmin", u"role", u"superuser"],
+    u"pii":      [u"email", u"phone", u"mobile", u"jumin", u"ssn"],
+}
+
+# =============================================================================
+# i18n
+# =============================================================================
+LANG = {
+    "ko": {
+        "lang": u"언어:", "version": u"버전: 1.0", "headers": u"헤더 포함",
+        "filter": u"대상 필터", "scope": u"Burp Scope 내 패킷만",
+        "find": u"찾기:", "refresh": u"도메인 새로고침", "toggle": u"전체 선택/해제",
+        "dom_col": u"도메인", "ext": u"제외 확장자(, 구분):",
+        "maxsize": u"최대 응답 크기(byte):", "range": u"검색 범위:", "kw_all": u"전체 선택/해제",
+        "range_both": u"요청+응답", "range_req": u"요청만", "range_resp": u"응답만",
+        "kw": u"키워드", "col_regex": u"정규식", "col_pkt": u"패킷", "col_match": u"매칭",
+        "case": u"대소문자 구분", "variants": u"한글 인코딩 변형 포함",
+        "add": u"추가", "del": u"삭제", "paste": u"Paste", "loadfile": u"파일 불러오기",
+        "preset": u"프리셋 불러오기", "scan": u"History 스캔",
+        "rt_on": u"실시간 ON", "rt_off": u"실시간 OFF", "csv": u"CSV 내보내기",
+        "collapse": u"중복 URL 접기", "clear": u"초기화",
+        "res_url": u"URL", "res_match": u"매칭", "res_len": u"Length", "res_time": u"Time",
+        "vsearch": u"검색:", "vauto": u"자동 스크롤", "wrap": u"줄바꿈",
+        "tab_search": u"키워드 검색", "tab_sec": u"시크릿", "tab_jwt": u"JWT",
+        "tab_err": u"에러", "tab_pii": u"개인정보",
+        "analyze": u"분석 실행",
+        "s_nokw": u"활성 키워드 없음", "s_done": u"스캔 완료: %d건",
+        "s_clear": u"초기화됨", "s_csv": u"CSV 저장: ",
+        "s_paste": u"붙여넣기: %d개 추가", "s_file": u"파일에서 %d개 추가",
+    },
+    "en": {
+        "lang": u"Language:", "version": u"Version: 1.0", "headers": u"Include headers",
+        "filter": u"Target Filter", "scope": u"In Burp Scope only",
+        "find": u"Find:", "refresh": u"Refresh domains", "toggle": u"Select / clear all",
+        "dom_col": u"Domain", "ext": u"Exclude extensions (, sep):",
+        "maxsize": u"Max response size (byte):", "range": u"Search in:", "kw_all": u"Select/clear all",
+        "range_both": u"Request+Response", "range_req": u"Request only",
+        "range_resp": u"Response only",
+        "kw": u"Keywords", "col_regex": u"Regex", "col_pkt": u"Packets", "col_match": u"Matches",
+        "case": u"Case sensitive", "variants": u"Include Korean encoding variants",
+        "add": u"Add", "del": u"Delete", "paste": u"Paste", "loadfile": u"Load file",
+        "preset": u"Load preset", "scan": u"Scan history",
+        "rt_on": u"Realtime ON", "rt_off": u"Realtime OFF", "csv": u"Export CSV",
+        "collapse": u"Collapse dup URLs", "clear": u"Clear",
+        "res_url": u"URL", "res_match": u"Matches", "res_len": u"Length", "res_time": u"Time",
+        "vsearch": u"Search:", "vauto": u"Auto-scroll", "wrap": u"Wrap",
+        "tab_search": u"Keyword Search", "tab_sec": u"Secrets", "tab_jwt": u"JWT",
+        "tab_err": u"Errors", "tab_pii": u"PII",
+        "analyze": u"Analyze",
+        "s_nokw": u"No active keyword", "s_done": u"Scan done: %d",
+        "s_clear": u"Cleared", "s_csv": u"CSV saved: ",
+        "s_paste": u"Pasted: %d added", "s_file": u"%d added from file",
+    },
+}
+
+# =============================================================================
+# 탭별 도움말 (? 버튼)
+# =============================================================================
+HELP = {
+    "ko": {
+        "search": (u"키워드 검색", u"""HTTP history에서 키워드로 요청/응답을 검색하는 탭입니다.
+
+[대상 필터] (왼쪽)
+- Burp Scope 내 패킷만: 체크 시 Scope 안의 패킷만 대상.
+- 도메인 체크리스트: 선택한 도메인만 검색(아무것도 안 고르면 전체). 찾기/새로고침/전체 토글 지원.
+- 제외 확장자: 쉼표로 구분한 확장자(jpg,png,css 등)를 결과에서 제외.
+- 최대 응답 크기(byte): 이 크기를 넘는 응답은 제외.
+- 검색 범위: 요청/응답 중 어디를 볼지. '헤더 포함' 체크 시 헤더까지 검색.
+
+[키워드]
+- 추가/삭제/Paste(클립보드 일괄)/파일 불러오기/프리셋.
+- 정규식 체크 시 그 키워드를 정규식으로 검색.
+- 한 번 클릭=단일 선택, 드래그/Ctrl=다중 선택, 단독 선택 재클릭=해제.
+- 전체 선택/해제, 대소문자 구분, 한글 인코딩 변형 포함 옵션.
+
+[동작]
+- History 스캔: 현재까지 쌓인 history를 일괄 검색.
+- 실시간 ON/OFF: 새로 들어오는 패킷을 자동 검사(이때 Time은 실제 수신 시각).
+- 중복 URL 접기: 같은 URL 패킷을 하나로 접기(length가 다르면 ▶로 펼쳐 확인).
+- 결과 행 선택 시 요청/응답 뷰어에 키워드가 자동 입력되고 매칭 위치로 스크롤.
+- Time: 실시간으로 받은 패킷만 실제 시각이 표시되고, 기존 history 패킷은 비어 있습니다."""),
+        "secrets": (u"시크릿", u"""응답에서 하드코딩된 비밀값을 탐지합니다. (지정 도메인 내에서만)
+
+- 프리셋 패턴: AWS 키(AKIA…), Google API(AIza…), Slack/GitHub 토큰, Private Key, Bearer 등.
+- 하드코딩 할당: api_key=, password=, token= 형태의 값.
+- High entropy: 패턴은 없지만 무작위성이 높은(entropy≥4.2) 문자열 → 알려지지 않은 커스텀 토큰 후보.
+
+컬럼: # / Type(종류) / Value(값) / Flags(entropy 점수 등) / Source URL(나온 패킷).
+같은 값은 중복 제거됩니다.
+
+[ entropy= 숫자란? ]
+문자열이 얼마나 무작위한지를 '비트/글자' 단위로 잰 섀넌 엔트로피 값입니다.
+높을수록 사람 말이 아니라 기계가 만든 랜덤 비밀값일 가능성이 큽니다.
+탐지 임계값은 4.2 이상(그 아래는 평범한 텍스트로 보고 무시).
+
+ entropy    성격                         예시
+ ~1.5–3.0   일반 영어 단어·문장(안 잡힘)   password, welcome
+ ~3.3–4.0   16진수(hex) 해시류            9f3b1c7e8a2d…
+ ~4.2–5.0   base64/영숫자 토큰           aGVsbG9zZWNyZXQ…
+ ~5.0–6.0   매우 무작위한 긴 키           랜덤 생성 API 시크릿
+
+이론상 상한: hex=4.0, 영숫자≈5.95, base64=6.0.
+그래서 hex 해시는 4.0 근처가 '꽉 찬' 값이고, base64 토큰은 5점대가 나와야
+진짜 랜덤에 가깝습니다.
+
+주의: 높은 entropy ≠ 무조건 비밀. 해시값·캐시 파일명·base64 이미지 조각도
+높게 나오므로(오탐) 숫자와 함께 Value·Source URL을 같이 확인하세요.
+4.2~4.4는 경계라 오탐이 많고, 5.0 이상은 진짜 랜덤 키일 확률이 높습니다."""),
+        "jwt": (u"JWT", u"""응답에서 JWT(eyJ…) 토큰을 찾아 디코딩합니다. (지정 도메인 내에서만)
+
+- header / payload를 Base64URL 디코딩해 상세창에 표시.
+- Flags: alg:none(서명 미검증 취약), valid/expired(exp 기준), has:role/admin 등 권한 클레임 존재.
+
+컬럼: alg(서명 알고리즘) / Flags / Source URL.
+행을 클릭하면 아래 상세창에 토큰 전체와 디코딩된 header/payload가 나옵니다."""),
+        "errors": (u"에러", u"""응답에 노출된 에러·스택트레이스를 탐지합니다. (지정 도메인 내에서만)
+
+- Java/Python/Oracle/SQL/.NET/PHP 등의 예외·스택트레이스 시그니처.
+- 서버 내부 경로·버전·쿼리 구조가 드러나는 지점을 찾는 데 사용.
+
+컬럼: Type(에러 종류) / Snippet(매칭 주변 문맥) / Source URL."""),
+        "pii": (u"개인정보", u"""응답에 노출된 개인정보(PII)를 탐지합니다. (지정 도메인 내에서만)
+
+- 주민등록번호, 휴대폰번호, 이메일, 카드번호(Luhn 검증) 형식.
+- 응답 본문에 개인정보가 평문으로 내려오는지 점검.
+
+컬럼: Type(종류) / Value(값) / Source URL.
+이메일 등은 양이 많을 수 있어 메시지당 상한이 걸려 있습니다."""),
+    },
+    "en": {
+        "search": (u"Keyword Search", u"""Search requests/responses in the HTTP history by keyword.
+
+Target Filter (left): scope toggle, domain checklist (only selected domains; none = all), exclude extensions, max response size, search range (+include headers).
+Keywords: add/delete/paste/load-file/preset; regex option; single click selects one, drag/Ctrl multi-select, re-click a sole selection to clear.
+Actions: scan history, realtime ON/OFF (Time = actual receive time), collapse duplicate URLs. Selecting a row fills the viewer search box with the keyword and scrolls to the match.
+Time is shown only for packets captured live; pre-existing history rows are blank."""),
+        "secrets": (u"Secrets", u"""Detects hardcoded secrets in responses (within selected domains).
+
+- Preset patterns: AWS (AKIA…), Google API (AIza…), Slack/GitHub tokens, Private Key, Bearer.
+- Hardcoded assignments: api_key=, password=, token=.
+- High entropy: random-looking strings (entropy>=4.2) with no known pattern — candidates for unknown custom tokens.
+
+Columns: # / Type / Value / Flags (e.g. entropy score) / Source URL. Duplicates removed.
+
+[ What is entropy=N? ]
+Shannon entropy in bits/char — how random the string is.
+Higher = more likely a machine-generated secret. Threshold: >= 4.2.
+
+ entropy    character                     example
+ ~1.5-3.0   plain word/sentence (ignored) password, welcome
+ ~3.3-4.0   hex hash                      9f3b1c7e8a2d…
+ ~4.2-5.0   base64 / alnum token          aGVsbG9zZWNyZXQ…
+ ~5.0-6.0   very random long key          random API secret
+
+Theoretical max: hex=4.0, alnum~5.95, base64=6.0.
+So a hex hash tops out near 4.0; a base64 token should reach the 5s to look
+truly random.
+
+Note: high entropy != always a secret. Hashes, cache filenames and base64
+image chunks also score high (false positives) — check Value and Source URL
+too. 4.2-4.4 is borderline; 5.0+ is more likely a real random key."""),
+        "jwt": (u"JWT", u"""Finds and decodes JWT (eyJ…) tokens (within selected domains).
+
+- Base64URL-decodes header/payload into the detail pane.
+- Flags: alg:none (unsigned/weak), valid/expired (by exp), has:role/admin claims.
+
+Columns: alg / Flags / Source URL. Click a row to see the full token and decoded header/payload."""),
+        "errors": (u"Errors", u"""Detects exposed errors/stack traces (within selected domains).
+
+- Java/Python/Oracle/SQL/.NET/PHP exception & stack-trace signatures.
+- Useful for finding internal paths, versions, query structure leakage.
+
+Columns: Type / Snippet / Source URL."""),
+        "pii": (u"PII", u"""Detects exposed personal data (within selected domains).
+
+- Korean RRN, mobile numbers, emails, card numbers (Luhn-validated).
+- Checks whether PII is returned in cleartext.
+
+Columns: Type / Value / Source URL. Capped per message to limit noise."""),
+    },
+}
+
+# =============================================================================
+# 디코딩 / 매칭 엔진
+# =============================================================================
+_CHARSET_RE = re.compile(r'charset\s*=\s*["\']?\s*([A-Za-z0-9_\-]+)', re.I)
+_META_RE = re.compile(r'<meta[^>]+charset\s*=\s*["\']?\s*([A-Za-z0-9_\-]+)', re.I)
+
+
+def _latin1(raw):
+    if raw is None:
+        return u""
+    return unicode(JString(raw, "ISO-8859-1"))
+
+
+def detect_charset(raw):
+    head = _latin1(raw)[:4096]
+    m = _CHARSET_RE.search(head) or _META_RE.search(head)
+    if m:
+        cs = m.group(1).strip().lower()
+        if cs in ("euc-kr", "euckr", "ks_c_5601-1987", "cp949"):
+            return "MS949"
+        return m.group(1)
+    return None
+
+
+def decode_bytes(raw):
+    if raw is None:
+        return u""
+    order = []
+    cs = detect_charset(raw)
+    if cs:
+        order.append(cs)
+    for c in ("UTF-8", "MS949"):
+        if c not in order:
+            order.append(c)
+    for c in order:
+        try:
+            return unicode(JString(raw, c))
+        except Exception:
+            continue
+    return _latin1(raw)
+
+
+def now_str():
+    """현재 로컬 시각(KST 등) 'yyyy-MM-dd HH:mm:ss'. 실시간 수신 시각."""
+    from java.text import SimpleDateFormat
+    from java.util import Date
+    return unicode(SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(Date()))
+
+
+_TIME_ACCESSOR = {}   # className -> java.lang.reflect.Method | None (한 번만 탐색)
+
+
+def reflect_time(msg):
+    """Burp history 항목 내부에 저장된 '프록시 통과 시각'을 reflection으로 획득.
+
+    HTTP history의 Time 컬럼과 동일한 값. 인자 없는 메서드 중 java.util.Date를
+    반환하고 이름에 time/date가 든 것만 안전하게 사용. 없으면 None.
+    """
+    try:
+        cls = msg.getClass()
+        key = cls.getName()
+        if key not in _TIME_ACCESSOR:
+            chosen = None
+            for m in cls.getMethods():
+                if len(m.getParameterTypes()) != 0:
+                    continue
+                if m.getReturnType().getName() != "java.util.Date":
+                    continue
+                nm = m.getName().lower()
+                if "time" in nm or "date" in nm:
+                    chosen = m
+                    break
+            _TIME_ACCESSOR[key] = chosen
+        m = _TIME_ACCESSOR[key]
+        if m is None:
+            return None
+        val = m.invoke(msg, [])
+        if val is None:
+            return None
+        from java.text import SimpleDateFormat
+        return unicode(SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(val))
+    except Exception:
+        return None
+
+
+def url_ext(url):
+    """URL 경로의 확장자(소문자) 반환. 없으면 빈 문자열."""
+    u = url.split("?", 1)[0].split("#", 1)[0]
+    seg = u.rsplit("/", 1)[-1]
+    if "." in seg:
+        return seg.rsplit(".", 1)[-1].lower()
+    return u""
+
+
+# =============================================================================
+# 3차: 탐지 엔진 (시크릿 / JWT / 에러 / PII / 파라미터)
+# =============================================================================
+def _shannon(s):
+    if not s:
+        return 0.0
+    counts = {}
+    for ch in s:
+        counts[ch] = counts.get(ch, 0) + 1
+    n = float(len(s))
+    ent = 0.0
+    for c in counts.values():
+        p = c / n
+        ent -= p * math.log(p, 2)
+    return ent
+
+
+SECRET_PATTERNS = [
+    ("AWS Access Key", re.compile(r"AKIA[0-9A-Z]{16}")),
+    ("Google API Key", re.compile(r"AIza[0-9A-Za-z\-_]{35}")),
+    ("Slack Token", re.compile(r"xox[baprs]-[0-9A-Za-z\-]{10,48}")),
+    ("Slack Webhook", re.compile(r"https://hooks\.slack\.com/services/[A-Za-z0-9/_\-]+")),
+    ("GitHub Token", re.compile(r"gh[opsu]_[0-9A-Za-z]{36}")),
+    ("Google OAuth", re.compile(r"[0-9]+-[0-9A-Za-z_]{20,}\.apps\.googleusercontent\.com")),
+    ("Private Key", re.compile(r"-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP |)PRIVATE KEY-----")),
+    ("Bearer Token", re.compile(r"[Bb]earer\s+[A-Za-z0-9._\-]{20,}")),
+]
+_ASSIGN_RE = re.compile(
+    r"""(?i)(api[_-]?key|secret|access[_-]?key|client[_-]?secret|passwd|password|token)"""
+    r"""["']?\s*[:=]\s*["']([^"'\s]{6,})["']""")
+_ENTROPY_RE = re.compile(r"[A-Za-z0-9+/=_\-]{24,100}")
+
+
+def extract_secrets(text):
+    """정규식 + 엔트로피로 하드코딩된 시크릿 추정값 추출 -> (type, value, flags)."""
+    res = []
+    if not text:
+        return res
+    seen = set()
+    for name, pat in SECRET_PATTERNS:
+        for m in pat.findall(text):
+            v = m if isinstance(m, (str, unicode)) else m[0]
+            key = (name, v)
+            if key in seen:
+                continue
+            seen.add(key)
+            res.append((name, v[:150], u""))
+    for m in _ASSIGN_RE.finditer(text):
+        val = m.group(2)
+        key = ("assign", val)
+        if key in seen:
+            continue
+        seen.add(key)
+        res.append((u"Hardcoded " + m.group(1), val[:150], u""))
+    ent_hits = 0
+    for m in _ENTROPY_RE.findall(text):
+        if ent_hits >= 25:
+            break
+        if any(m == v for (_, v, _) in res):
+            continue
+        ent = _shannon(m)
+        if ent >= 4.2:
+            key = ("ent", m)
+            if key in seen:
+                continue
+            seen.add(key)
+            ent_hits += 1
+            res.append((u"High entropy", m[:150], u"entropy=%.1f" % ent))
+    return res
+
+
+_JWT_RE = re.compile(r"eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]*")
+
+
+def _b64url(s):
+    s = s.replace("-", "+").replace("_", "/")
+    pad = len(s) % 4
+    if pad:
+        s += "=" * (4 - pad)
+    return base64.b64decode(s)
+
+
+def extract_jwts(text, now_epoch):
+    """JWT 탐지 + header/payload 디코딩 -> (alg, flags, detail, token)."""
+    res = []
+    if not text:
+        return res
+    seen = set()
+    for tok in _JWT_RE.findall(text):
+        if tok in seen:
+            continue
+        seen.add(tok)
+        parts = tok.split(".")
+        try:
+            hdr = json.loads(_b64url(parts[0]))
+        except Exception:
+            hdr = {}
+        try:
+            pl = json.loads(_b64url(parts[1])) if len(parts) > 1 else {}
+        except Exception:
+            pl = {}
+        alg = unicode(hdr.get("alg", "?")) if isinstance(hdr, dict) else "?"
+        flags = []
+        if alg.lower() == "none":
+            flags.append("alg:none")
+        if isinstance(pl, dict):
+            exp = pl.get("exp")
+            if isinstance(exp, (int, float)):
+                flags.append("expired" if exp < now_epoch else "valid")
+            for k in ("role", "roles", "admin", "isAdmin", "scope", "authorities"):
+                if k in pl:
+                    flags.append("has:" + k)
+        detail = u"token:\n%s\n\nheader:\n%s\n\npayload:\n%s" % (
+            tok,
+            json.dumps(hdr, indent=2, ensure_ascii=False),
+            json.dumps(pl, indent=2, ensure_ascii=False))
+        res.append((alg, ",".join(flags), detail, tok))
+    return res
+
+
+ERROR_PATTERNS = [
+    ("Java stacktrace", re.compile(r"at [\w.$]+\([\w ]+\.java:\d+\)")),
+    ("Java exception", re.compile(r"\b[\w.]*Exception\b")),
+    ("Python traceback", re.compile(r"Traceback \(most recent call last\)")),
+    ("Oracle error", re.compile(r"ORA-\d{5}")),
+    ("SQL error", re.compile(r"(?i)SQL syntax|SQLException|SQLSTATE|error in your SQL")),
+    (".NET error", re.compile(r"(?i)System\.(?:Web|Data|Null)|Microsoft OLE DB|Server Error in")),
+    ("PHP error", re.compile(r"(?i)(?:Warning|Fatal error|Notice): .+ on line \d+|Undefined (?:index|variable)")),
+    ("Stack trace", re.compile(r"(?i)stack trace")),
+]
+
+
+def extract_errors(text):
+    res = []
+    if not text:
+        return res
+    seen = set()
+    for name, pat in ERROR_PATTERNS:
+        for m in pat.finditer(text):
+            s = max(0, m.start() - 40)
+            e = min(len(text), m.end() + 80)
+            snip = text[s:e].replace("\n", " ").replace("\r", " ").strip()
+            key = (name, snip[:60])
+            if key in seen:
+                continue
+            seen.add(key)
+            res.append((name, snip[:200]))
+            if len(res) >= 60:
+                return res
+    return res
+
+
+def _luhn(num):
+    digits = [int(d) for d in num if d.isdigit()]
+    if len(digits) < 13:
+        return False
+    total = 0
+    alt = False
+    for d in reversed(digits):
+        if alt:
+            d *= 2
+            if d > 9:
+                d -= 9
+        total += d
+        alt = not alt
+    return total % 10 == 0
+
+
+PII_PATTERNS = [
+    ("RRN(주민번호)", re.compile(r"\b\d{6}[-\s]?[1-4]\d{6}\b")),
+    ("Phone(휴대폰)", re.compile(r"\b01[016789][-\s]?\d{3,4}[-\s]?\d{4}\b")),
+    ("Email", re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")),
+    ("Card", re.compile(r"\b\d{4}[-\s]?\d{4}[-\s]?\d{4}[-\s]?\d{4}\b")),
+]
+
+
+def extract_pii(text):
+    res = []
+    if not text:
+        return res
+    seen = set()
+    for name, pat in PII_PATTERNS:
+        for v in pat.findall(text):
+            if name == "Card" and not _luhn(v):
+                continue
+            key = (name, v)
+            if key in seen:
+                continue
+            seen.add(key)
+            res.append((name, v))
+            if len(res) >= 300:
+                return res
+    return res
+
+
+def korean_variants(kw):
+    out = []
+    if all(ord(ch) < 128 for ch in kw):
+        return out
+    out.append(u"".join(u"\\u%04x" % ord(ch) for ch in kw))
+    out.append(u"".join(u"\\u%04X" % ord(ch) for ch in kw))
+    try:
+        out.append(u"".join(u"%%%02X" % b for b in bytearray(kw.encode("utf-8"))))
+    except Exception:
+        pass
+    try:
+        enc = JString(kw).getBytes("MS949")
+        out.append(u"".join(u"%%%02X" % (b & 0xff) for b in enc))
+    except Exception:
+        pass
+    out.append(u"".join(u"&#%d;" % ord(ch) for ch in kw))
+    out.append(u"".join(u"&#x%X;" % ord(ch) for ch in kw))
+    return out
+
+
+def body_start(text):
+    """헤더/본문 구분 지점(본문 시작 오프셋). 없으면 0."""
+    for sep in ("\r\n\r\n", "\n\n"):
+        i = text.find(sep)
+        if i >= 0:
+            return i + len(sep)
+    return 0
+
+
+def find_offsets(text, kw, is_regex, case_sensitive, use_variants):
+    if not text or not kw:
+        return []
+    spans = []
+    flags = 0 if case_sensitive else re.I
+    if is_regex:
+        try:
+            for m in re.finditer(kw, text, flags):
+                spans.append((m.start(), m.end()))
+        except re.error:
+            pass
+        return spans
+    needles = [kw]
+    if use_variants:
+        needles += korean_variants(kw)
+    hay = text if case_sensitive else text.lower()
+    for ndl in needles:
+        n = ndl if case_sensitive else ndl.lower()
+        if not n:
+            continue
+        start = 0
+        while True:
+            i = hay.find(n, start)
+            if i < 0:
+                break
+            spans.append((i, i + len(n)))
+            start = i + len(n)
+    spans.sort()
+    return spans
+
+
+# =============================================================================
+# 결과 레코드
+# =============================================================================
+class Result(object):
+    __slots__ = ("msg", "host", "url", "keyword", "is_regex", "length", "time",
+                 "req_text", "resp_text", "req_spans", "resp_spans", "count", "seen")
+
+    def __init__(self, msg, host, url, keyword, is_regex, length, time,
+                 req_text, resp_text, req_spans, resp_spans, seen=True):
+        self.msg = msg
+        self.host = host
+        self.url = url
+        self.keyword = keyword
+        self.is_regex = is_regex
+        self.length = length
+        self.time = time
+        self.req_text = req_text
+        self.resp_text = resp_text
+        self.req_spans = req_spans
+        self.resp_spans = resp_spans
+        self.count = len(req_spans) + len(resp_spans)
+        self.seen = seen   # False = 실시간으로 새로 추가된 미확인 행
+
+
+# =============================================================================
+# 테이블 모델
+# =============================================================================
+class KeywordTableModel(DefaultTableModel):
+    def getColumnClass(self, c):
+        return Boolean if c in (0, 2) else JString
+    def isCellEditable(self, r, c):
+        return c in (0, 1, 2)
+
+
+class DomainTableModel(DefaultTableModel):
+    def getColumnClass(self, c):
+        return Boolean if c == 0 else JString
+    def isCellEditable(self, r, c):
+        return c == 0
+
+
+class ReadOnlyTableModel(DefaultTableModel):
+    def isCellEditable(self, r, c):
+        return False
+
+
+# =============================================================================
+# Pretty 포매팅 (JSON / HTML·XML / JS)
+# =============================================================================
+def _pretty_markup(s):
+    s = re.sub(r">\s*<", ">\n<", s)
+    out = []
+    depth = 0
+    void_re = re.compile(r"<(br|img|hr|meta|link|input|col|area|base)\b", re.I)
+    open_re = re.compile(r"^<[^/!?][^>]*[^/]>$")
+    for line in s.split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith("</"):
+            depth = max(0, depth - 1)
+        out.append("  " * depth + line)
+        if open_re.match(line) and not void_re.match(line):
+            depth += 1
+    return "\n".join(out)
+
+
+def _pretty_js(s):
+    """문자열 인식 없는 best-effort JS/CSS 정렬 (가독성 보조용)."""
+    out = []
+    depth = 0
+    buf = []
+    for ch in s:
+        if ch == "{":
+            buf.append(ch)
+            out.append("  " * depth + "".join(buf).strip())
+            buf = []
+            depth += 1
+        elif ch == "}":
+            if "".join(buf).strip():
+                out.append("  " * depth + "".join(buf).strip())
+                buf = []
+            depth = max(0, depth - 1)
+            out.append("  " * depth + "}")
+        elif ch == ";":
+            buf.append(ch)
+            out.append("  " * depth + "".join(buf).strip())
+            buf = []
+        else:
+            buf.append(ch)
+    tail = "".join(buf).strip()
+    if tail:
+        out.append("  " * depth + tail)
+    return "\n".join(l for l in out if l.strip())
+
+
+def make_pretty(raw):
+    """헤더는 그대로 두고 본문(JSON/HTML/XML/JS)만 보기 좋게 포맷."""
+    if not raw:
+        return raw
+    sep = "\r\n\r\n" if "\r\n\r\n" in raw else ("\n\n" if "\n\n" in raw else None)
+    if sep:
+        head, body = raw.split(sep, 1)
+    else:
+        head, body = u"", raw
+    b = body.strip()
+    pretty = body
+    try:
+        if b[:1] in ("{", "["):
+            pretty = json.dumps(json.loads(b), indent=2, ensure_ascii=False)
+        elif b[:1] == "<" or re.search(r"<\s*(html|!doctype|\?xml)", b, re.I):
+            pretty = _pretty_markup(b)
+        elif ("{" in b and "}" in b and ";" in b
+              and (b.count("\n") * 200 < len(b))
+              and re.search(r"(function|=>|var |let |const )", b)):
+            pretty = _pretty_js(b)
+    except Exception:
+        pretty = body
+    return (head + "\n\n" + pretty) if sep else pretty
+
+
+# =============================================================================
+# 검색칸 내장 뷰어 (Pretty/Raw 탭 + 줄바꿈 + \n + 키워드 자동입력 + 자동 스크롤)
+# =============================================================================
+class SearchViewer(JPanel):
+    LIGHT = Color(255, 240, 150)
+    STRONG = Color(255, 150, 60)
+
+    def __init__(self):
+        self.setLayout(BorderLayout())
+
+        bar = JPanel(FlowLayout(FlowLayout.LEFT, 4, 2))
+        self.wrap_chk = JCheckBox("", True)
+        self.wrap_chk.addActionListener(WrapListener(self))
+        self.nl_chk = JCheckBox("\\n", False)   # non-printable(CR/탭) 표시
+        self.nl_chk.addActionListener(NlListener(self))
+        self.lbl = JLabel()
+        self.field = JTextField(12)
+        self.auto = JCheckBox("", True)
+        self.prev_btn = JButton(u"◀", actionPerformed=self._prev)
+        self.next_btn = JButton(u"▶", actionPerformed=self._next)
+        self.counter = JLabel("0 / 0")
+        for c in (self.wrap_chk, self.nl_chk, self.lbl, self.field,
+                  self.auto, self.prev_btn, self.next_btn, self.counter):
+            bar.add(c)
+        self.add(bar, BorderLayout.NORTH)
+
+        self.pretty_area = self._make_area()
+        self.raw_area = self._make_area()
+        self.tabs = JTabbedPane()
+        self.tabs.addTab("Pretty", JScrollPane(self.pretty_area))
+        self.tabs.addTab("Raw", JScrollPane(self.raw_area))
+        self.tabs.addChangeListener(TabListener(self))
+        self.add(self.tabs, BorderLayout.CENTER)
+
+        self.field.getDocument().addDocumentListener(SVFindListener(self))
+        self.raw_text = u""
+        self.spans = []
+        self.idx = -1
+        self.regex_mode = False
+        self.case = False
+        self.variants = True
+        self._suppress = False
+
+    def _make_area(self):
+        a = JTextArea()
+        a.setEditable(False)
+        a.setLineWrap(True)
+        a.setWrapStyleWord(False)
+        a.setFont(Font("Monospaced", Font.PLAIN, 12))
+        return a
+
+    def _area(self):
+        return self.pretty_area if self.tabs.getSelectedIndex() == 0 else self.raw_area
+
+    def set_labels(self, search_label, auto_label, wrap_label):
+        self.lbl.setText(search_label)
+        self.auto.setText(auto_label)
+        self.wrap_chk.setText(wrap_label)
+
+    def _raw_display(self):
+        if not self.nl_chk.isSelected():
+            return self.raw_text
+        # CR/LF/TAB을 일반 글자 크기의 \r \n \t 로 표시. 줄바꿈은 유지.
+        # \x00 을 '실제 줄바꿈' 임시표식으로 써서 중복 치환 방지.
+        t = self.raw_text.replace(u"\t", u"\\t")
+        t = t.replace(u"\r\n", u"\\r\\n\x00")
+        t = t.replace(u"\r", u"\\r")
+        t = t.replace(u"\n", u"\\n\x00")
+        t = t.replace(u"\x00", u"\n")
+        return t
+
+    def load(self, text, term, is_regex, case, variants):
+        self.raw_text = text or u""
+        self.regex_mode = is_regex
+        self.case = case
+        self.variants = variants
+        self.pretty_area.setText(make_pretty(self.raw_text))
+        self.raw_area.setText(self._raw_display())
+        self.pretty_area.setCaretPosition(0)
+        self.raw_area.setCaretPosition(0)
+        self._suppress = True
+        self.field.setText(term or u"")
+        self._suppress = False
+        self._recompute(scroll=True)
+
+    def _on_tab_change(self):
+        self._recompute(scroll=self.auto.isSelected())
+
+    def _on_wrap_change(self):
+        sel = self.wrap_chk.isSelected()
+        self.pretty_area.setLineWrap(sel)
+        self.raw_area.setLineWrap(sel)
+
+    def _on_nl_change(self):
+        self.raw_area.setText(self._raw_display())
+        self.raw_area.setCaretPosition(0)
+        if self.tabs.getSelectedIndex() == 1:
+            self._recompute(scroll=self.auto.isSelected())
+
+    def _on_field_change(self):
+        if self._suppress:
+            return
+        self.regex_mode = False   # 사용자가 직접 입력하면 리터럴 검색
+        self._recompute(scroll=self.auto.isSelected())
+
+    def _recompute(self, scroll):
+        term = self.field.getText()
+        text = self._area().getText()
+        self.spans = find_offsets(text, term, self.regex_mode,
+                                  self.case, self.variants)
+        self.idx = 0 if self.spans else -1
+        self._paint()
+        if self.spans and scroll:
+            self._scroll_to(0)
+        self._counter()
+
+    def _paint(self):
+        area = self._area()
+        hl = area.getHighlighter()
+        hl.removeAllHighlights()
+        light = DefaultHighlighter.DefaultHighlightPainter(self.LIGHT)
+        strong = DefaultHighlighter.DefaultHighlightPainter(self.STRONG)
+        for j, (a, b) in enumerate(self.spans):
+            try:
+                hl.addHighlight(a, b, strong if j == self.idx else light)
+            except Exception:
+                pass
+
+    def _scroll_to(self, i):
+        if not self.spans:
+            return
+        self.idx = i % len(self.spans)
+        area = self._area()
+        s, e = self.spans[self.idx]
+        try:
+            area.setCaretPosition(e)
+            rect = area.modelToView(s)
+            if rect:
+                area.scrollRectToVisible(rect)
+        except Exception:
+            pass
+        self._paint()
+        self._counter()
+
+    def _prev(self, ev):
+        if self.spans:
+            self._scroll_to(self.idx - 1)
+
+    def _next(self, ev):
+        if self.spans:
+            self._scroll_to(self.idx + 1)
+
+    def _counter(self):
+        total = len(self.spans)
+        cur = (self.idx + 1) if self.idx >= 0 else 0
+        self.counter.setText("%d / %d" % (cur, total))
+
+
+# =============================================================================
+# 분석 탭 패널 (표 + 상세 텍스트)
+# =============================================================================
+class AnalysisPanel(JPanel):
+    def __init__(self, columns, widths, on_scan, on_help=None):
+        columns = ["#"] + list(columns)     # 새 행 구별용 번호 열
+        widths = [44] + list(widths)
+        self.setLayout(BorderLayout())
+        bar = JPanel(BorderLayout())
+        left = JPanel(FlowLayout(FlowLayout.LEFT, 4, 2))
+        self.scan_btn = JButton(actionPerformed=lambda e: on_scan())
+        self.realtime = True   # 실시간 기본 ON
+        self._rt_on = "RT ON"
+        self._rt_off = "RT OFF"
+        self.rt_btn = JButton(actionPerformed=lambda e: self._toggle_rt())
+        self.count_lbl = JLabel(" ")
+        left.add(self.scan_btn)
+        left.add(self.rt_btn)
+        left.add(self.count_lbl)
+        bar.add(left, BorderLayout.WEST)
+        if on_help is not None:
+            self.help_btn = JButton(u"❓", actionPerformed=lambda e: on_help())
+            self.help_btn.setToolTipText("Help")
+            bar.add(self.help_btn, BorderLayout.EAST)
+        self.add(bar, BorderLayout.NORTH)
+
+        self.model = ReadOnlyTableModel(columns, 0)
+        self.table = JTable(self.model)
+        self.table.setAutoResizeMode(JTable.AUTO_RESIZE_OFF)
+        self.table.getSelectionModel().setSelectionMode(
+            ListSelectionModel.SINGLE_SELECTION)
+        cm = self.table.getColumnModel()
+        self._renderer = APRowRenderer(self)
+        for i, w in enumerate(widths):
+            col = cm.getColumn(i)
+            col.setPreferredWidth(w)
+            col.setCellRenderer(self._renderer)
+        self.table.getSelectionModel().addListSelectionListener(APSelListener(self))
+
+        self.detail = JTextArea()
+        self.detail.setEditable(False)
+        self.detail.setLineWrap(True)
+        self.detail.setWrapStyleWord(False)
+        self.detail.setFont(Font("Monospaced", Font.PLAIN, 12))
+
+        split = JSplitPane(JSplitPane.VERTICAL_SPLIT,
+                           JScrollPane(self.table), JScrollPane(self.detail))
+        split.setResizeWeight(0.72)
+        self.add(split, BorderLayout.CENTER)
+        self._details = []
+        self._seen = set()     # 중복 제거 키
+        self._new = set()      # 미확인(새로 추가된) 행 인덱스
+        self._refresh_rt_label()
+
+    def _toggle_rt(self):
+        self.realtime = not self.realtime
+        self._refresh_rt_label()
+
+    def _refresh_rt_label(self):
+        self.rt_btn.setText(self._rt_on if self.realtime else self._rt_off)
+
+    def set_rt_texts(self, on, off):
+        self._rt_on, self._rt_off = on, off
+        self._refresh_rt_label()
+
+    def set_rows(self, rows, seen=None):
+        self.model.setRowCount(0)
+        self._details = []
+        self._seen = set(seen) if seen is not None else set()
+        self._new = set()
+        for i, (cells, det) in enumerate(rows):
+            self.model.addRow([unicode(i + 1)] + list(cells))
+            self._details.append(det)
+        self.count_lbl.setText("%d" % len(rows))
+        self.table.repaint()
+
+    def add_one(self, key, cells, detail, mark_new):
+        """실시간 1건 추가. 중복이면 False. 추가되면 True."""
+        if key in self._seen:
+            return False
+        self._seen.add(key)
+        self.model.addRow([unicode(self.model.getRowCount() + 1)] + list(cells))
+        self._details.append(detail)
+        if mark_new:
+            self._new.add(self.model.getRowCount() - 1)
+        self.count_lbl.setText("%d" % self.model.getRowCount())
+        self.table.repaint()
+        return True
+
+    def _on_select(self):
+        r = self.table.getSelectedRow()
+        if r < 0:
+            return
+        if 0 <= r < len(self._details):
+            self.detail.setText(self._details[r])
+            self.detail.setCaretPosition(0)
+        if r in self._new:
+            self._new.discard(r)
+            self.table.repaint()
+
+    def set_scan_label(self, s):
+        self.scan_btn.setText(s)
+
+
+# =============================================================================
+# 메인
+# =============================================================================
+class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory):
+
+    def registerExtenderCallbacks(self, callbacks):
+        self._cb = callbacks
+        self._helpers = callbacks.getHelpers()
+        callbacks.setExtensionName("KeywordHunter")
+
+        self.results = []
+        self.realtime = True   # 실시간 기본 ON
+        self.lang = "ko"
+        self._filtered = []
+        self._display_rows = []
+        self._collapse = False
+        self._expanded = set()
+        self._status = ("", None)
+        self._collapse_bg = None
+        self._kw_armed_row = -1     # 직전에 '단독 선택'돼 있던 행
+        self._kw_suppress = False
+
+        self._build_ui()
+        self._load_settings()
+        self._apply_language()
+        self._refresh_domains(None)
+
+        callbacks.customizeUiComponent(self.root)
+        callbacks.addSuiteTab(self)
+        callbacks.registerHttpListener(self)
+        callbacks.registerContextMenuFactory(self)
+        print("KeywordHunter loaded")
+
+    # ---- ITab ----
+    def getTabCaption(self):
+        return "KeywordHunter"
+
+    def getUiComponent(self):
+        return self.root
+
+    def _t(self, key):
+        return LANG[self.lang].get(key, key)
+
+    # =====================================================================
+    # UI
+    # =====================================================================
+    def _build_ui(self):
+        self.root = JPanel(BorderLayout())
+
+        top = JPanel(BorderLayout())
+        west = JPanel(FlowLayout(FlowLayout.LEFT, 4, 2))
+        self.lbl_lang = JLabel()
+        self.lang_box = JComboBox([u"한국어", u"English"])
+        self.lang_box.addActionListener(LangListener(self))
+        west.add(self.lbl_lang)
+        west.add(self.lang_box)
+        top.add(west, BorderLayout.WEST)
+        self.lbl_version = JLabel()
+        self.lbl_version.setBorder(BorderFactory.createEmptyBorder(0, 0, 0, 10))
+        top.add(self.lbl_version, BorderLayout.EAST)
+        self.root.add(top, BorderLayout.NORTH)
+
+        split = JSplitPane(JSplitPane.HORIZONTAL_SPLIT)
+        split.setResizeWeight(0.33)
+        split.setLeftComponent(self._build_left())
+        split.setRightComponent(self._build_right())
+        self.root.add(split, BorderLayout.CENTER)
+
+    def _build_left(self):
+        left = JSplitPane(JSplitPane.VERTICAL_SPLIT)
+        left.setResizeWeight(0.5)
+        left.setTopComponent(self._build_filter_panel())
+        left.setBottomComponent(self._build_keyword_panel())
+        return left
+
+    def _build_filter_panel(self):
+        p = JPanel(BorderLayout())
+        self.filter_border = BorderFactory.createTitledBorder("")
+        p.setBorder(self.filter_border)
+
+        north = JPanel(GridLayout(0, 1, 2, 2))
+        self.chk_scope = JCheckBox("", False)
+        north.add(self.chk_scope)
+
+        fr = JPanel(FlowLayout(FlowLayout.LEFT, 4, 0))
+        self.lbl_find = JLabel()
+        self.find_field = JTextField(10)
+        self.find_field.getDocument().addDocumentListener(FindListener(self))
+        self.btn_refresh = JButton(actionPerformed=self._refresh_domains)
+        self.btn_toggle = JButton(actionPerformed=lambda e: self._toggle_all_domains())
+        for c in (self.lbl_find, self.find_field, self.btn_refresh, self.btn_toggle):
+            fr.add(c)
+        north.add(fr)
+        p.add(north, BorderLayout.NORTH)
+
+        self.dom_model = DomainTableModel(["", ""], 0)
+        self.dom_table = JTable(self.dom_model)
+        self.dom_table.getColumnModel().getColumn(0).setMaxWidth(24)
+        self.dom_sorter = TableRowSorter(self.dom_model)
+        self.dom_table.setRowSorter(self.dom_sorter)
+        p.add(JScrollPane(self.dom_table), BorderLayout.CENTER)
+
+        south = JPanel(GridLayout(0, 1, 2, 2))
+        extp = JPanel(FlowLayout(FlowLayout.LEFT, 4, 0))
+        self.lbl_ext = JLabel()
+        self.ext_field = JTextField("jpg, png, woff, avi, mp4, css", 22)
+        extp.add(self.lbl_ext)
+        extp.add(self.ext_field)
+        south.add(extp)
+
+        sz = JPanel(FlowLayout(FlowLayout.LEFT, 4, 0))
+        self.lbl_size = JLabel()
+        self.max_kb = JTextField("2000000", 8)
+        sz.add(self.lbl_size)
+        sz.add(self.max_kb)
+        south.add(sz)
+
+        rg = JPanel(FlowLayout(FlowLayout.LEFT, 4, 0))
+        self.lbl_range = JLabel()
+        self.search_in = JComboBox()
+        self.chk_headers = JCheckBox("", False)
+        rg.add(self.lbl_range)
+        rg.add(self.search_in)
+        rg.add(self.chk_headers)
+        south.add(rg)
+        p.add(south, BorderLayout.SOUTH)
+        return p
+
+    def _build_keyword_panel(self):
+        p = JPanel(BorderLayout())
+        self.kw_border = BorderFactory.createTitledBorder("")
+        p.setBorder(self.kw_border)
+
+        self.kw_model = KeywordTableModel(["", "", "", "", ""], 0)
+        self.kw_table = JTable(self.kw_model)
+        self.kw_table.setAutoResizeMode(JTable.AUTO_RESIZE_OFF)
+        self._size_kw_columns()
+        self.kw_table.getSelectionModel().setSelectionMode(
+            ListSelectionModel.MULTIPLE_INTERVAL_SELECTION)
+        self.kw_table.getSelectionModel().addListSelectionListener(
+            KwSelListener(self))
+        self.kw_table.addMouseListener(KwMouseListener(self))
+        p.add(JScrollPane(self.kw_table), BorderLayout.CENTER)
+
+        opts = JPanel(FlowLayout(FlowLayout.LEFT, 4, 0))
+        self.chk_case = JCheckBox("", False)
+        self.chk_kw_all = JCheckBox("", False)
+        self.chk_kw_all.addActionListener(KwAllListener(self))
+        self.chk_variants = JCheckBox("", True)
+        opts.add(self.chk_kw_all)
+        opts.add(self.chk_case)
+        opts.add(self.chk_variants)
+
+        row1 = JPanel(FlowLayout(FlowLayout.LEFT, 4, 0))
+        self.kw_input = JTextField(12)
+        self.btn_add = JButton(actionPerformed=self._add_keyword)
+        self.btn_del = JButton(actionPerformed=self._del_keyword)
+        self.btn_paste = JButton(actionPerformed=self._paste_keywords)
+        self.btn_loadfile = JButton(actionPerformed=self._load_file)
+        for c in (self.kw_input, self.btn_add, self.btn_del,
+                  self.btn_paste, self.btn_loadfile):
+            row1.add(c)
+
+        row2 = JPanel(FlowLayout(FlowLayout.LEFT, 4, 0))
+        self.preset_box = JComboBox(list(PRESETS.keys()))
+        self.btn_preset = JButton(actionPerformed=self._load_preset)
+        row2.add(self.preset_box)
+        row2.add(self.btn_preset)
+
+        south = JPanel(GridLayout(0, 1))
+        south.add(opts)
+        south.add(row1)
+        south.add(row2)
+        p.add(south, BorderLayout.SOUTH)
+        return p
+
+    def _build_right(self):
+        self.right_tabs = JTabbedPane()
+        self.right_tabs.addTab("", self._build_search_panel())
+
+        self.sec_panel = AnalysisPanel(
+            ["Type", "Value", "Flags", "Source URL"],
+            [160, 320, 110, 300], self._run_analysis,
+            on_help=lambda: self._show_help("secrets"))
+        self.jwt_panel = AnalysisPanel(
+            ["alg", "Flags", "Source URL"],
+            [80, 220, 360], self._run_analysis,
+            on_help=lambda: self._show_help("jwt"))
+        self.err_panel = AnalysisPanel(
+            ["Type", "Snippet", "Source URL"],
+            [150, 420, 300], self._run_analysis,
+            on_help=lambda: self._show_help("errors"))
+        self.pii_panel = AnalysisPanel(
+            ["Type", "Value", "Source URL"],
+            [130, 300, 320], self._run_analysis,
+            on_help=lambda: self._show_help("pii"))
+        for pnl in (self.sec_panel, self.jwt_panel, self.err_panel,
+                    self.pii_panel):
+            self.right_tabs.addTab("", pnl)
+        self.right_tabs.addChangeListener(RightTabsListener(self))
+        return self.right_tabs
+
+    def _build_search_panel(self):
+        right = JSplitPane(JSplitPane.VERTICAL_SPLIT)
+        right.setResizeWeight(0.4)
+
+        top = JPanel(BorderLayout())
+        toolbar = JPanel(FlowLayout(FlowLayout.LEFT, 4, 2))
+        self.btn_scan = JButton(actionPerformed=self._scan_history)
+        self.rt_btn = JButton(actionPerformed=self._toggle_realtime)
+        self.btn_csv = JButton(actionPerformed=self._export_csv)
+        self.btn_clear = JButton(actionPerformed=self._clear)
+        self.btn_collapse = JButton(actionPerformed=self._toggle_collapse)
+        for b in (self.btn_scan, self.rt_btn, self.btn_csv,
+                  self.btn_clear, self.btn_collapse):
+            toolbar.add(b)
+        self.progress = JProgressBar()
+        self.progress.setStringPainted(True)
+        toolbar.add(self.progress)
+        self.status = JLabel(" ")
+        toolbar.add(self.status)
+
+        bar = JPanel(BorderLayout())
+        bar.add(toolbar, BorderLayout.WEST)
+        self.btn_help = JButton(u"❓", actionPerformed=lambda e: self._show_help("search"))
+        self.btn_help.setToolTipText("Help")
+        bar.add(self.btn_help, BorderLayout.EAST)
+        top.add(bar, BorderLayout.NORTH)
+
+        self.res_model = ReadOnlyTableModel(["#", "Host", "URL", "", "", "", ""], 0)
+        self.res_table = JTable(self.res_model)
+        self.res_table.setAutoResizeMode(JTable.AUTO_RESIZE_OFF)
+        self._row_renderer = RowRenderer(self)
+        self._size_res_columns()
+        self.res_table.getSelectionModel().setSelectionMode(
+            ListSelectionModel.SINGLE_SELECTION)
+        self.res_table.getSelectionModel().addListSelectionListener(
+            ResSelListener(self))
+        self.res_table.addMouseListener(ResMouseListener(self))
+        top.add(JScrollPane(self.res_table), BorderLayout.CENTER)
+        right.setTopComponent(top)
+
+        viewers = JSplitPane(JSplitPane.HORIZONTAL_SPLIT)
+        viewers.setResizeWeight(0.5)
+        self.req_view = SearchViewer()
+        self.resp_view = SearchViewer()
+        viewers.setLeftComponent(self.req_view)
+        viewers.setRightComponent(self.resp_view)
+        right.setBottomComponent(viewers)
+        return right
+
+    # =====================================================================
+    # 컬럼 크기 (드래그 리사이즈 가능, 기본 폭은 이름이 잘리지 않게)
+    # =====================================================================
+    def _size_kw_columns(self):
+        cm = self.kw_table.getColumnModel()
+        widths = [30, 220, 70, 60, 60]   # ✓ / 키워드 / 정규식 / 패킷 / 매칭
+        for i, w in enumerate(widths):
+            col = cm.getColumn(i)
+            col.setMinWidth(24)
+            col.setPreferredWidth(w)
+
+    def _size_res_columns(self):
+        cm = self.res_table.getColumnModel()
+        # # / Host / URL / 키워드 / 매칭 / Length / Time
+        widths = [50, 160, 330, 110, 55, 70, 150]
+        for i, w in enumerate(widths):
+            col = cm.getColumn(i)
+            col.setMinWidth(20)
+            col.setPreferredWidth(w)
+            col.setCellRenderer(self._row_renderer)
+
+    # =====================================================================
+    # 언어 적용
+    # =====================================================================
+    def _apply_language(self):
+        t = self._t
+        self.lbl_lang.setText(t("lang"))
+        self.lbl_version.setText(t("version"))
+        self.chk_headers.setText(t("headers"))
+        self.filter_border.setTitle(t("filter"))
+        self.chk_scope.setText(t("scope"))
+        self.lbl_find.setText(t("find"))
+        self.btn_refresh.setText(t("refresh"))
+        self.btn_toggle.setText(t("toggle"))
+        self.lbl_ext.setText(t("ext"))
+        self.lbl_size.setText(t("maxsize"))
+        self.lbl_range.setText(t("range"))
+        self.kw_border.setTitle(t("kw"))
+        self.chk_case.setText(t("case"))
+        self.chk_kw_all.setText(t("kw_all"))
+        self.chk_variants.setText(t("variants"))
+        self.btn_add.setText(t("add"))
+        self.btn_del.setText(t("del"))
+        self.btn_paste.setText(t("paste"))
+        self.btn_loadfile.setText(t("loadfile"))
+        self.btn_preset.setText(t("preset"))
+        self.btn_scan.setText(t("scan"))
+        self.rt_btn.setText(t("rt_on") if self.realtime else t("rt_off"))
+        self.btn_csv.setText(t("csv"))
+        self.btn_collapse.setText(t("collapse"))
+        self.btn_clear.setText(t("clear"))
+        self.req_view.set_labels(t("vsearch"), t("vauto"), t("wrap"))
+        self.resp_view.set_labels(t("vsearch"), t("vauto"), t("wrap"))
+        self._render_status()
+
+        for i, key in enumerate(("tab_search", "tab_sec", "tab_jwt",
+                                 "tab_err", "tab_pii")):
+            self.right_tabs.setTitleAt(i, t(key))
+        for pnl in (self.sec_panel, self.jwt_panel, self.err_panel,
+                    self.pii_panel):
+            pnl.set_scan_label(t("analyze"))
+            pnl.set_rt_texts(t("rt_on"), t("rt_off"))
+
+        idx = max(0, self.search_in.getSelectedIndex())
+        self.search_in.removeAllItems()
+        for k in ("range_both", "range_req", "range_resp"):
+            self.search_in.addItem(t(k))
+        self.search_in.setSelectedIndex(idx)
+
+        self.dom_model.setColumnIdentifiers(["", t("dom_col")])
+        self.dom_table.getColumnModel().getColumn(0).setMaxWidth(24)
+        self.kw_model.setColumnIdentifiers(
+            ["", t("kw"), t("col_regex"), t("col_pkt"), t("col_match")])
+        self._size_kw_columns()
+        self.res_model.setColumnIdentifiers(
+            ["#", "Host", t("res_url"), t("kw"), t("res_match"),
+             t("res_len"), t("res_time")])
+        self._size_res_columns()
+        self.root.revalidate()
+        self.root.repaint()
+
+    def _on_lang_change(self):
+        self.lang = "ko" if self.lang_box.getSelectedIndex() == 0 else "en"
+        self._apply_language()
+
+    # =====================================================================
+    # 도메인
+    # =====================================================================
+    def _refresh_domains(self, ev):
+        existing = {}
+        for r in range(self.dom_model.getRowCount()):
+            host = unicode(self.dom_model.getValueAt(r, 1))
+            existing[host] = bool(self.dom_model.getValueAt(r, 0))
+        hosts = set(existing.keys())
+        for msg in self._cb.getProxyHistory():
+            try:
+                hosts.add(msg.getHttpService().getHost())
+            except Exception:
+                pass
+        self.dom_model.setRowCount(0)
+        for host in sorted(hosts):
+            self.dom_model.addRow([Boolean(existing.get(host, False)), host])
+
+    def _toggle_all_domains(self):
+        rows = range(self.dom_table.getRowCount())
+        all_checked = True
+        for vr in rows:
+            mr = self.dom_table.convertRowIndexToModel(vr)
+            if not self.dom_model.getValueAt(mr, 0):
+                all_checked = False
+                break
+        target = not all_checked
+        for vr in rows:
+            mr = self.dom_table.convertRowIndexToModel(vr)
+            self.dom_model.setValueAt(Boolean(target), mr, 0)
+
+    def _apply_find(self):
+        txt = self.find_field.getText()
+        if not txt:
+            self.dom_sorter.setRowFilter(None)
+        else:
+            self.dom_sorter.setRowFilter(
+                RowFilter.regexFilter("(?i)" + Pattern.quote(txt), 1))
+
+    def _checked_domains(self):
+        out = set()
+        for r in range(self.dom_model.getRowCount()):
+            if self.dom_model.getValueAt(r, 0):
+                out.add(unicode(self.dom_model.getValueAt(r, 1)))
+        return out
+
+    def _ext_set(self):
+        out = set()
+        for p in self.ext_field.getText().split(","):
+            p = p.strip().lstrip(".").lower()
+            if p:
+                out.add(p)
+        return out
+
+    # =====================================================================
+    # 키워드
+    # =====================================================================
+    def _existing_keywords(self):
+        return set(unicode(self.kw_model.getValueAt(r, 1))
+                   for r in range(self.kw_model.getRowCount()))
+
+    def _add_kw_row(self, kw, regex=False):
+        self.kw_model.addRow([Boolean(True), kw, Boolean(regex), u"0", u"0"])
+
+    def _add_keyword(self, ev):
+        txt = self.kw_input.getText().strip()
+        if txt and txt not in self._existing_keywords():
+            self._add_kw_row(txt)
+            self.kw_input.setText("")
+
+    def _del_keyword(self, ev):
+        # 선택(하이라이트)된 행 + 체크박스가 켜진 행을 모두 삭제
+        targets = set(self.kw_table.getSelectedRows())
+        for r in range(self.kw_model.getRowCount()):
+            if self.kw_model.getValueAt(r, 0):
+                targets.add(r)
+        for r in sorted(targets, reverse=True):
+            self.kw_model.removeRow(r)
+
+    def _bulk_add(self, lines):
+        existing = self._existing_keywords()
+        n = 0
+        for line in lines:
+            kw = line.strip()
+            if kw and kw not in existing:
+                self._add_kw_row(kw)
+                existing.add(kw)
+                n += 1
+        return n
+
+    def _paste_keywords(self, ev):
+        try:
+            clip = Toolkit.getDefaultToolkit().getSystemClipboard()
+            data = clip.getData(DataFlavor.stringFlavor)
+            n = self._bulk_add(unicode(data).splitlines())
+            self._set_status("s_paste", n)
+        except Exception as e:
+            self.status.setText(u"paste error: %s" % e)
+
+    def _load_file(self, ev):
+        chooser = JFileChooser()
+        if chooser.showOpenDialog(self.root) != JFileChooser.APPROVE_OPTION:
+            return
+        path = chooser.getSelectedFile().getAbsolutePath()
+        raw = open(path, "rb").read()
+        try:
+            text = raw.decode("utf-8")
+        except Exception:
+            text = unicode(JString(raw, "MS949"))
+        n = self._bulk_add(text.splitlines())
+        self._set_status("s_file", n)
+
+    def _load_preset(self, ev):
+        self._bulk_add(PRESETS.get(self.preset_box.getSelectedItem(), []))
+
+    def _toggle_all_keywords(self):
+        val = self.chk_kw_all.isSelected()
+        for r in range(self.kw_model.getRowCount()):
+            self.kw_model.setValueAt(Boolean(val), r, 0)
+
+    def _enabled_keywords(self):
+        out = []
+        for r in range(self.kw_model.getRowCount()):
+            if self.kw_model.getValueAt(r, 0):
+                kw = unicode(self.kw_model.getValueAt(r, 1)).strip()
+                if kw:
+                    out.append((kw, bool(self.kw_model.getValueAt(r, 2))))
+        return out
+
+    # =====================================================================
+    # 필터
+    # =====================================================================
+    def _passes_filter(self, msg):
+        try:
+            svc = msg.getHttpService()
+            host = svc.getHost()
+            analyzed = self._helpers.analyzeRequest(msg)
+            url = analyzed.getUrl().toString()
+        except Exception:
+            return None
+        if self.chk_scope.isSelected():
+            try:
+                if not self._cb.isInScope(analyzed.getUrl()):
+                    return None
+            except Exception:
+                pass
+        checked = self._checked_domains()
+        if checked and host not in checked:
+            return None
+        exts = self._ext_set()
+        if exts and url_ext(url) in exts:   # 제외할 확장자
+            return None
+        resp = msg.getResponse()
+        if resp is not None:
+            try:
+                if len(resp) > int(self.max_kb.getText()):
+                    return None
+            except Exception:
+                pass
+        return (host, url)
+
+    # =====================================================================
+    # 스캔
+    # =====================================================================
+    def _scan_history(self, ev):
+        kws = self._enabled_keywords()
+        if not kws:
+            self._set_status("s_nokw")
+            return
+        history = self._cb.getProxyHistory()
+
+        def work():
+            total = len(history)
+            SwingUtilities.invokeLater(lambda: self.progress.setMaximum(total))
+            self.results = []
+            for i, msg in enumerate(history):
+                self._scan_one(msg, kws, u"")   # history: 실제 캡처 시각 불명 -> 비움
+                if i % 20 == 0:
+                    v = i
+                    SwingUtilities.invokeLater(lambda v=v: self.progress.setValue(v))
+            SwingUtilities.invokeLater(self._refresh_all)
+            SwingUtilities.invokeLater(lambda: self.progress.setValue(total))
+            SwingUtilities.invokeLater(
+                lambda: self._set_status("s_done", len(self.results)))
+
+        Thread(RunnableWrap(work)).start()
+
+    def _scan_one(self, msg, kws, default_time, mark_new=False):
+        meta = self._passes_filter(msg)
+        if meta is None:
+            return
+        host, url = meta
+        tstr = reflect_time(msg) or default_time   # 프록시 통과 시각 우선, 없으면 폴백
+        mode = self.search_in.getSelectedIndex()
+        case = self.chk_case.isSelected()
+        variants = self.chk_variants.isSelected()
+        resp_raw = msg.getResponse()
+        length = len(resp_raw) if resp_raw else 0
+        req_text = decode_bytes(msg.getRequest()) if mode in (0, 1) else u""
+        resp_text = decode_bytes(resp_raw) if mode in (0, 2) else u""
+        inc_hdr = self.chk_headers.isSelected()
+
+        def spans_for(text, kw, is_rx):
+            if not text:
+                return []
+            if inc_hdr:
+                return find_offsets(text, kw, is_rx, case, variants)
+            bs = body_start(text)
+            return [(a + bs, b + bs)
+                    for (a, b) in find_offsets(text[bs:], kw, is_rx, case, variants)]
+
+        for (kw, is_rx) in kws:
+            rq = spans_for(req_text, kw, is_rx)
+            rs = spans_for(resp_text, kw, is_rx)
+            if rq or rs:
+                self.results.append(
+                    Result(msg, host, url, kw, is_rx, length, tstr,
+                           req_text, resp_text, rq, rs, seen=(not mark_new)))
+
+    # =====================================================================
+    # 3차 분석 (시크릿 / JWT / 에러 / PII) 한 번에 — 지정 도메인 내에서만
+    # =====================================================================
+    def _run_analysis(self):
+        history = self._cb.getProxyHistory()
+        try:
+            import time as _t
+            now = int(_t.time())
+        except Exception:
+            now = 0
+
+        def work():
+            sec_rows = []
+            jwt_rows = []
+            err_rows = []
+            pii_rows = []
+            sec_seen = set()
+            pii_seen = set()
+            jwt_seen = set()
+            err_seen = set()
+
+            for msg in history:
+                meta = self._passes_filter(msg)
+                if meta is None:
+                    continue
+                host, url = meta
+                resp = msg.getResponse()
+                if resp is None:
+                    continue
+                text = decode_bytes(resp)
+
+                for name, val, flags in extract_secrets(text):
+                    k = (name, val)
+                    if k in sec_seen:
+                        continue
+                    sec_seen.add(k)
+                    sec_rows.append(
+                        ([name, val, flags, url],
+                         u"%s\n%s\nflags: %s\n(from %s)" % (name, val, flags, url)))
+
+                for alg, flags, detail, tok in extract_jwts(text, now):
+                    if tok in jwt_seen:
+                        continue
+                    jwt_seen.add(tok)
+                    jwt_rows.append(
+                        ([alg, flags, url], detail + u"\n\n(from %s)" % url))
+
+                for name, snip in extract_errors(text):
+                    k = (name, snip[:60])
+                    if k in err_seen:
+                        continue
+                    err_seen.add(k)
+                    err_rows.append(
+                        ([name, snip, url],
+                         u"%s\n%s\n(from %s)" % (name, snip, url)))
+
+                for name, val in extract_pii(text):
+                    k = (name, val)
+                    if k in pii_seen:
+                        continue
+                    pii_seen.add(k)
+                    pii_rows.append(
+                        ([name, val, url], u"%s: %s\n(from %s)" % (name, val, url)))
+
+            def done():
+                self.sec_panel.set_rows(sec_rows, sec_seen)
+                self.jwt_panel.set_rows(jwt_rows, jwt_seen)
+                self.err_panel.set_rows(err_rows, err_seen)
+                self.pii_panel.set_rows(pii_rows, pii_seen)
+
+            SwingUtilities.invokeLater(done)
+
+        Thread(RunnableWrap(work)).start()
+
+    def _show_help(self, which):
+        title, body = HELP[self.lang].get(which, (u"Help", u""))
+        area = JTextArea(body)
+        area.setEditable(False)
+        area.setLineWrap(True)
+        area.setWrapStyleWord(True)
+        area.setColumns(52)
+        area.setRows(20)
+        area.setCaretPosition(0)
+        JOptionPane.showMessageDialog(
+            self.root, JScrollPane(area), title, JOptionPane.INFORMATION_MESSAGE)
+
+    # ---- 실시간 ----
+    def _toggle_realtime(self, ev):
+        self.realtime = not self.realtime
+        self.rt_btn.setText(self._t("rt_on") if self.realtime else self._t("rt_off"))
+
+    def processHttpMessage(self, toolFlag, messageIsRequest, messageInfo):
+        if messageIsRequest or toolFlag != TOOL_PROXY:
+            return
+        # 키워드 검색 탭 실시간
+        if self.realtime:
+            kws = self._enabled_keywords()
+            if kws:
+                before = len(self.results)
+                self._scan_one(messageInfo, kws, now_str(), mark_new=True)
+                if len(self.results) != before:
+                    SwingUtilities.invokeLater(self._on_search_realtime_added)
+        # 분석 탭들 실시간
+        self._realtime_analyze(messageInfo)
+
+    def _on_search_realtime_added(self):
+        self._refresh_all()
+        self._mark_tab_new(0)   # 키워드 검색 탭
+
+    def _tab_index(self, pnl):
+        return self.right_tabs.indexOfComponent(pnl)
+
+    def _mark_tab_new(self, idx):
+        if idx >= 0 and self.right_tabs.getSelectedIndex() != idx:
+            self.right_tabs.setBackgroundAt(idx, NEW_TAB_COLOR)
+
+    def _realtime_analyze(self, msg):
+        if not (self.sec_panel.realtime or self.jwt_panel.realtime
+                or self.err_panel.realtime or self.pii_panel.realtime):
+            return
+        meta = self._passes_filter(msg)
+        if meta is None:
+            return
+        host, url = meta
+        resp = msg.getResponse()
+        if resp is None:
+            return
+        text = decode_bytes(resp)
+        import time as _t
+        now = int(_t.time())
+        sec = extract_secrets(text) if self.sec_panel.realtime else []
+        jwts = extract_jwts(text, now) if self.jwt_panel.realtime else []
+        errs = extract_errors(text) if self.err_panel.realtime else []
+        piis = extract_pii(text) if self.pii_panel.realtime else []
+        if not (sec or jwts or errs or piis):
+            return
+
+        def apply():
+            a = False
+            for name, val, flags in sec:
+                if self.sec_panel.add_one(
+                        (name, val), [name, val, flags, url],
+                        u"%s\n%s\nflags: %s\n(from %s)" % (name, val, flags, url),
+                        True):
+                    a = True
+            if a:
+                self._mark_tab_new(self._tab_index(self.sec_panel))
+            b = False
+            for alg, flags, detail, tok in jwts:
+                if self.jwt_panel.add_one(
+                        tok, [alg, flags, url],
+                        detail + u"\n\n(from %s)" % url, True):
+                    b = True
+            if b:
+                self._mark_tab_new(self._tab_index(self.jwt_panel))
+            c = False
+            for name, snip in errs:
+                if self.err_panel.add_one(
+                        (name, snip[:60]), [name, snip, url],
+                        u"%s\n%s\n(from %s)" % (name, snip, url), True):
+                    c = True
+            if c:
+                self._mark_tab_new(self._tab_index(self.err_panel))
+            d = False
+            for name, val in piis:
+                if self.pii_panel.add_one(
+                        (name, val), [name, val, url],
+                        u"%s: %s\n(from %s)" % (name, val, url), True):
+                    d = True
+            if d:
+                self._mark_tab_new(self._tab_index(self.pii_panel))
+
+        SwingUtilities.invokeLater(apply)
+
+    # =====================================================================
+    # 결과 표시
+    # =====================================================================
+    def _refresh_all(self):
+        self._update_keyword_counts()
+        self._filter_results_by_keyword()
+
+    def _update_keyword_counts(self):
+        packets, matches = {}, {}
+        for res in self.results:
+            packets[res.keyword] = packets.get(res.keyword, 0) + 1
+            matches[res.keyword] = matches.get(res.keyword, 0) + res.count
+        for r in range(self.kw_model.getRowCount()):
+            kw = unicode(self.kw_model.getValueAt(r, 1))
+            self.kw_model.setValueAt(unicode(packets.get(kw, 0)), r, 3)
+            self.kw_model.setValueAt(unicode(matches.get(kw, 0)), r, 4)
+
+    def _filter_results_by_keyword(self):
+        rows = self.kw_table.getSelectedRows()
+        sel_kws = set(unicode(self.kw_model.getValueAt(r, 1)) for r in rows)
+        self._filtered = [res for res in self.results
+                          if (not sel_kws) or res.keyword in sel_kws]
+        self._rebuild_result_rows()
+
+    def _add_disp(self, label, res, has_exp, expanded, gray, child):
+        if has_exp:
+            host = (u"▼ " if expanded else u"▶ ") + res.host
+        elif child:
+            host = u"  " + res.host
+        else:
+            host = res.host
+        url = (u"  " + res.url) if child else res.url
+        kw = (u"  " + res.keyword) if child else res.keyword
+        self._display_rows.append(
+            {"res": res, "gray": gray, "has_exp": has_exp, "url": res.url})
+        self.res_model.addRow([label, host, url, kw, unicode(res.count),
+                               unicode(res.length), res.time])
+
+    def _rebuild_result_rows(self):
+        self.res_model.setRowCount(0)
+        self._display_rows = []
+        counter = 0
+        if not self._collapse:
+            for res in self._filtered:
+                counter += 1
+                self._add_disp(unicode(counter), res, False, False, False, False)
+        else:
+            groups = OrderedDict()
+            for res in self._filtered:
+                groups.setdefault(res.url, []).append(res)
+            for url, grp in groups.items():
+                if len(grp) == 1 or len(set(r.length for r in grp)) == 1:
+                    # 단일이거나 length까지 동일 = 완전 중복 -> 하나로 생략
+                    counter += 1
+                    self._add_disp(unicode(counter), grp[0], False, False, False, False)
+                else:
+                    # length가 다른 중복 -> 대표행 회색 + 펼침 아이콘
+                    counter += 1
+                    parent = counter
+                    expanded = url in self._expanded
+                    self._add_disp(unicode(parent), grp[0], True, expanded, True, False)
+                    if expanded:
+                        for ci, res in enumerate(grp[1:]):
+                            label = u"%d-%d" % (parent, ci + 2)
+                            self._add_disp(label, res, False, False, True, True)
+
+    def _toggle_collapse(self, ev):
+        self._collapse = not self._collapse
+        b = self.btn_collapse
+        if self._collapse:
+            if self._collapse_bg is None:
+                self._collapse_bg = b.getBackground()
+            b.setOpaque(True)
+            b.setContentAreaFilled(True)
+            b.setBackground(Color(110, 140, 185))   # 활성: 진한 색
+        else:
+            if self._collapse_bg is not None:
+                b.setBackground(self._collapse_bg)
+        self._rebuild_result_rows()
+
+    def _toggle_expand(self, row):
+        if row < 0 or row >= len(self._display_rows):
+            return
+        ent = self._display_rows[row]
+        if not ent["has_exp"]:
+            return
+        url = ent["url"]
+        if url in self._expanded:
+            self._expanded.discard(url)
+        else:
+            self._expanded.add(url)
+        self._rebuild_result_rows()
+
+    def _show_selected_result(self):
+        r = self.res_table.getSelectedRow()
+        if r < 0 or r >= len(self._display_rows):
+            return
+        res = self._display_rows[r]["res"]
+        if not res.seen:
+            res.seen = True   # 확인함 -> 하이라이트 해제
+            self.res_table.repaint()
+        self.req_view.load(res.req_text, res.keyword, res.is_regex,
+                           self.chk_case.isSelected(), self.chk_variants.isSelected())
+        self.resp_view.load(res.resp_text, res.keyword, res.is_regex,
+                            self.chk_case.isSelected(), self.chk_variants.isSelected())
+
+    # ---- 컨텍스트 메뉴 ----
+    def createMenuItems(self, invocation):
+        r = self.res_table.getSelectedRow()
+        if r < 0 or r >= len(self._display_rows):
+            return None
+        res = self._display_rows[r]["res"]
+
+        def send(ev):
+            svc = res.msg.getHttpService()
+            self._cb.sendToRepeater(svc.getHost(), svc.getPort(),
+                                    svc.getProtocol() == "https",
+                                    res.msg.getRequest(), "KeywordHunter")
+        return [JMenuItem("Send to Repeater", actionPerformed=send)]
+
+    # ---- CSV ----
+    def _export_csv(self, ev):
+        chooser = JFileChooser()
+        if chooser.showSaveDialog(self.root) != JFileChooser.APPROVE_OPTION:
+            return
+        path = chooser.getSelectedFile().getAbsolutePath()
+        if not path.lower().endswith(".csv"):
+            path += ".csv"
+        f = open(path, "wb")
+        try:
+            w = csv.writer(f)
+            w.writerow(["host", "url", "keyword", "matches", "length", "time"])
+            for res in self.results:
+                w.writerow([res.host.encode("utf-8"), res.url.encode("utf-8"),
+                            res.keyword.encode("utf-8"), res.count, res.length,
+                            res.time.encode("utf-8")])
+        finally:
+            f.close()
+        self._set_status("s_csv", path)
+
+    def _clear(self, ev):
+        self.results = []
+        self._filtered = []
+        self._display_rows = []
+        self._expanded = set()
+        self.res_model.setRowCount(0)
+        self.req_view.load(u"", u"", False, False, True)
+        self.resp_view.load(u"", u"", False, False, True)
+        self._update_keyword_counts()
+        self._set_status("s_clear")
+
+    # ---- 상태표시(언어 전환 시에도 갱신) ----
+    def _set_status(self, key, arg=None):
+        self._status = (key, arg)
+        self._render_status()
+
+    def _render_status(self):
+        key, arg = self._status
+        if not key:
+            self.status.setText(" ")
+            return
+        txt = self._t(key)
+        if arg is None:
+            self.status.setText(txt)
+        else:
+            try:
+                self.status.setText(txt % arg)
+            except Exception:
+                self.status.setText(txt + unicode(arg))
+
+    # ---- 설정 ----
+    def _save_settings(self):
+        rows = []
+        for r in range(self.kw_model.getRowCount()):
+            rows.append(u"\t".join([
+                u"1" if self.kw_model.getValueAt(r, 0) else u"0",
+                unicode(self.kw_model.getValueAt(r, 1)),
+                u"1" if self.kw_model.getValueAt(r, 2) else u"0"]))
+        self._cb.saveExtensionSetting("keywords", u"\n".join(rows).encode("utf-8"))
+
+    def _load_settings(self):
+        data = self._cb.loadExtensionSetting("keywords")
+        if not data:
+            return
+        try:
+            data = data.decode("utf-8")
+        except Exception:
+            pass
+        for line in data.splitlines():
+            parts = line.split(u"\t")
+            if len(parts) >= 3:
+                self.kw_model.addRow([Boolean(parts[0] == u"1"), parts[1],
+                                      Boolean(parts[2] == u"1"), u"0", u"0"])
+
+
+# =============================================================================
+# 리스너 / 유틸
+# =============================================================================
+class RunnableWrap(Runnable):
+    def __init__(self, fn):
+        self.fn = fn
+    def run(self):
+        self.fn()
+
+
+class LangListener(ActionListener):
+    def __init__(self, outer):
+        self.outer = outer
+    def actionPerformed(self, ev):
+        self.outer._on_lang_change()
+
+
+class KwSelListener(ListSelectionListener):
+    def __init__(self, outer):
+        self.outer = outer
+    def valueChanged(self, ev):
+        if not ev.getValueIsAdjusting():
+            self.outer._filter_results_by_keyword()
+
+
+class KwMouseListener(MouseAdapter):
+    """일반 클릭=단일 선택, 드래그/Ctrl=다중, 단독 선택된 행 재클릭=해제.
+
+    Swing 기본 선택 처리가 이 리스너보다 먼저 실행되므로, '현재' 선택이 아니라
+    직전 인터랙션에서 저장해 둔 _kw_armed_row(직전 단독 선택 행)로 재클릭을 판별한다.
+    """
+    def __init__(self, outer):
+        self.outer = outer
+
+    def mousePressed(self, ev):
+        if ev.isControlDown() or ev.isShiftDown():
+            self.outer._kw_suppress = False
+            return
+        tbl = self.outer.kw_table
+        row = tbl.rowAtPoint(ev.getPoint())
+        if row >= 0 and row == self.outer._kw_armed_row:
+            # 직전에 이 행만 선택돼 있었는데 또 눌렀다 -> 해제
+            self.outer._kw_suppress = True
+            SwingUtilities.invokeLater(tbl.clearSelection)
+        else:
+            self.outer._kw_suppress = False
+
+    def mouseReleased(self, ev):
+        tbl = self.outer.kw_table
+        if self.outer._kw_suppress:
+            self.outer._kw_armed_row = -1
+            self.outer._kw_suppress = False
+            return
+        self.outer._kw_armed_row = (
+            tbl.getSelectedRow() if tbl.getSelectedRowCount() == 1 else -1)
+
+
+class ResSelListener(ListSelectionListener):
+    def __init__(self, outer):
+        self.outer = outer
+    def valueChanged(self, ev):
+        if not ev.getValueIsAdjusting():
+            self.outer._show_selected_result()
+
+
+class ResMouseListener(MouseAdapter):
+    def __init__(self, outer):
+        self.outer = outer
+    def mousePressed(self, ev):
+        tbl = self.outer.res_table
+        row = tbl.rowAtPoint(ev.getPoint())
+        col = tbl.columnAtPoint(ev.getPoint())
+        if row < 0:
+            return
+        ent = self.outer._display_rows[row] if row < len(self.outer._display_rows) else None
+        # Host 컬럼(펼침 아이콘)을 누르면 접기/펼치기 토글
+        if ent and ent["has_exp"] and col == 1:
+            SwingUtilities.invokeLater(lambda: self.outer._toggle_expand(row))
+
+
+class RowRenderer(DefaultTableCellRenderer):
+    GRAY = Color(235, 235, 235)
+
+    def __init__(self, outer):
+        self.outer = outer
+
+    def getTableCellRendererComponent(self, table, value, isSelected,
+                                      hasFocus, row, col):
+        comp = DefaultTableCellRenderer.getTableCellRendererComponent(
+            self, table, value, isSelected, hasFocus, row, col)
+        gray = False
+        unseen = False
+        try:
+            ent = self.outer._display_rows[row]
+            gray = ent["gray"]
+            unseen = (not ent["res"].seen)
+        except Exception:
+            pass
+        if not isSelected:
+            if unseen:
+                comp.setBackground(NEW_ROW_COLOR)   # 미확인 새 행 우선
+            elif gray:
+                comp.setBackground(self.GRAY)
+            else:
+                comp.setBackground(table.getBackground())
+        return comp
+
+
+class FindListener(DocumentListener):
+    def __init__(self, outer):
+        self.outer = outer
+    def insertUpdate(self, ev):
+        self.outer._apply_find()
+    def removeUpdate(self, ev):
+        self.outer._apply_find()
+    def changedUpdate(self, ev):
+        self.outer._apply_find()
+
+
+class SVFindListener(DocumentListener):
+    def __init__(self, viewer):
+        self.viewer = viewer
+    def insertUpdate(self, ev):
+        self.viewer._on_field_change()
+    def removeUpdate(self, ev):
+        self.viewer._on_field_change()
+    def changedUpdate(self, ev):
+        self.viewer._on_field_change()
+
+
+class TabListener(ChangeListener):
+    def __init__(self, viewer):
+        self.viewer = viewer
+    def stateChanged(self, ev):
+        self.viewer._on_tab_change()
+
+
+class WrapListener(ActionListener):
+    def __init__(self, viewer):
+        self.viewer = viewer
+    def actionPerformed(self, ev):
+        self.viewer._on_wrap_change()
+
+
+class KwAllListener(ActionListener):
+    def __init__(self, outer):
+        self.outer = outer
+    def actionPerformed(self, ev):
+        self.outer._toggle_all_keywords()
+
+
+class APSelListener(ListSelectionListener):
+    def __init__(self, panel):
+        self.panel = panel
+    def valueChanged(self, ev):
+        if not ev.getValueIsAdjusting():
+            self.panel._on_select()
+
+
+class APRowRenderer(DefaultTableCellRenderer):
+    def __init__(self, panel):
+        self.panel = panel
+    def getTableCellRendererComponent(self, table, value, isSelected,
+                                      hasFocus, row, col):
+        comp = DefaultTableCellRenderer.getTableCellRendererComponent(
+            self, table, value, isSelected, hasFocus, row, col)
+        if not isSelected:
+            comp.setBackground(NEW_ROW_COLOR if row in self.panel._new
+                               else table.getBackground())
+        return comp
+
+
+class RightTabsListener(ChangeListener):
+    def __init__(self, outer):
+        self.outer = outer
+    def stateChanged(self, ev):
+        idx = self.outer.right_tabs.getSelectedIndex()
+        if idx >= 0:
+            self.outer.right_tabs.setBackgroundAt(idx, None)   # 원래 색 복귀
+
+
+class NlListener(ActionListener):
+    def __init__(self, viewer):
+        self.viewer = viewer
+    def actionPerformed(self, ev):
+        self.viewer._on_nl_change()
